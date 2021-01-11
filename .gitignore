@@ -1,2 +1,3 @@
-/importBillableItems/node_modules/
 .idea/*
+/importBillableItems/node_modules/
+/importClients/node_modules/

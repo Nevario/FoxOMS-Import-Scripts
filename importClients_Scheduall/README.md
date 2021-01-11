@@ -1,4 +1,4 @@
-# FoxOMS Import Billable Items Script
+# FoxOMS Import Scheduall Agency & Client Script
 
 ## Dependencies
 * NodeJS
