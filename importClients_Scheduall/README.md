@@ -1,5 +1,9 @@
 # FoxOMS Import Scheduall Agency & Client Script
 
+## Overview
+
+With this script, you can take a Scheduall Agency & Client CSV export file and import it into your FoxOMS account.
+
 ## Dependencies
 * NodeJS
 
