@@ -2,7 +2,7 @@
 
 ## Overview
 
-With this script, you can take a Scheduall Agency & Client CSV export file and import it into your FoxOMS account.
+With this script, you can take a ScheduAll Agency & Client CSV export file and import it into your [FoxOMS](https://www.foxoms.com) account.
 
 ## Dependencies
 * NodeJS
