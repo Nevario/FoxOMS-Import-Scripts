@@ -2,15 +2,16 @@
 const csvtojson = require("csvtojson");
 const request = require('superagent');
 const Throttle = require('superagent-throttle');
-const csvFilePath = 'private/FW_Export_Contacts.csv';
-const apiKey = '******';
-const apiUrl = 'https://api-dev.sonderplan.com/v2';
+const csvFilePath = 'private/farmerswife-contacts-export.csv';
+const apiKey = 'YOUR_API_KEY_HERE';
+const apiUrl = 'https://api.sonderplan.com/v2';
 
-const fwIdField = 'custom_field_313'; // Specify custom field for tracking the FarmersWife ID
-const categoryField = 'custom_field_312'; // Specify custom field for tracking the Contact Category
+const fwIdField = 'custom_field_XXX'; // Specify custom field for tracking the FarmersWife ID
+const categoryField = 'custom_field_XXX'; // Specify custom field for tracking the Contact Category
 
 const newCount = {
-    contacts: 0
+    contacts: 0,
+    organizations: 0
 }
 
 // Set up the throttle plugin
@@ -21,44 +22,77 @@ const throttle = new Throttle({
     concurrent: 1        // how many requests can be sent concurrently
 });
 
+const normalize = (s) => (s || '').toString().trim().toLowerCase();
+
 exports.handler = async () => {
     try {
         const jsonArray = await csvtojson().fromFile(csvFilePath);
-        const contacts = [];
-        const organizations = [];
 
-        console.log('jsonArray', jsonArray);
+        // caches
+        const contacts = [];
+        const organizations = []; // orgs created during this run
+        const orgIndex = new Map(); // lcName -> { id, name }
+
+        // seed index with orgs that already exist server-side
+        const existingOrganizations = await getExistingOrganizations(); // [{id,name,type}, ...]
+        if (Array.isArray(existingOrganizations)) {
+            for (const org of existingOrganizations) {
+                if (org?.name && org?.id) {
+                    orgIndex.set(normalize(org.name), { id: org.id, name: org.name });
+                }
+            }
+        }
 
         for (const line of jsonArray) {
-
             const contact = {
-                name: line['First Name'] + ' ' + line['Last Name'],
+                name: `${line['First Name'] || ''} ${line['Last Name'] || ''}`.trim(),
                 email_1: line['Email'],
                 phone_1: line['Phone Work'],
                 phone_2: line['Phone Mobile'],
                 address_line_1: line['Address'],
                 website: line['WWW'],
-                notes: 'Title: ' + line['Title'],
+                notes: `Title: ${line['Title'] || ''}`.trim(),
                 type: 'person'
-            }
+            };
 
             contact[fwIdField] = line['ID'];
             contact[categoryField] = line['Category'];
 
-            if(line['Company'].length > 0) {
-                // Check for existing organization entry in organizations array of object
-                const existingOrg = organizations.find(company => company.name === line['Company'].toLowerCase());
+            const companyRaw = (line['Company'] || '').toString().trim();
+            if (companyRaw.length > 0) {
+                const lc = normalize(companyRaw);
 
-                if(existingOrg) {
-                    // If it exists, return the organization id
-                    contact['org_id'] = existingOrg.id;
-                } else {
+                // 1) check index (server-seeded + run-local)
+                let org = orgIndex.get(lc);
 
+                // 2) fallback to local array just in case
+                if (!org) {
+                    const existingLocal = organizations.find(o => normalize(o.name) === lc);
+                    if (existingLocal) org = existingLocal;
                 }
 
+                // 3) create if still missing
+                if (!org) {
+                    const orgId = await createOrganization({
+                        name: companyRaw,
+                        type: 'organization'
+                    });
 
+                    if (orgId) {
+                        org = { id: parseInt(orgId, 10), name: companyRaw };
+                        organizations.push(org);
+                        orgIndex.set(lc, org);
+                        newCount.organizations++;
+                        console.log('created organization', org);
+                    } else {
+                        console.warn(`Failed to create organization for "${companyRaw}" – leaving contact without org_id`);
+                    }
+                }
 
-                // Else create the org and add to our array of objects
+                // attach org_id if available
+                if (org?.id) {
+                    contact['linked_organization_id'] = org.id;
+                }
             }
 
             contacts.push(contact);
@@ -66,9 +100,8 @@ exports.handler = async () => {
 
         const sonderplanContacts = await createOrUpdateContacts(contacts);
 
+        console.log('new counts', newCount);
         console.log('contacts', sonderplanContacts);
-
-
     } catch (error) {
         console.error('Error in handler:', error);
     }
@@ -84,10 +117,9 @@ async function createOrUpdateContacts(contacts){
     const existingClients = await getExistingClientContacts();
 
     for (const contact of contacts) {
-        if(contact.name.length === 0) {
-            continue;
-        }
-        const existingClient = existingClients.find(ec => ec.name === contact.name);
+        if(!contact.name || contact.name.length === 0) continue;
+        const existingClient = existingClients?.find(ec => ec.name === contact.name);
+
         if (existingClient) {
             contact.uuid = existingClient.uuid;
             await updateContact(contact, contact.uuid);
@@ -96,8 +128,10 @@ async function createOrUpdateContacts(contacts){
             contact.client = true;
 
             const newContactId = await createContact(contact);
-            contact.id = parseInt(newContactId);
-            existingClients.push(contact)
+            if (newContactId) {
+                contact.id = parseInt(newContactId, 10);
+                existingClients?.push?.(contact);
+            }
         }
     }
 
@@ -126,6 +160,55 @@ async function getExistingClientContacts() {
 }
 
 /**
+ * Retrieve existing organizations from server.
+ *
+ * @returns {Promise<Array|false>}
+ */
+async function getExistingOrganizations() {
+    try {
+        const response = await request
+            .get(`${apiUrl}/contact?fields=id,name,type&limit=1000&type=organization`)
+            .set('Authorization', 'Bearer ' + apiKey)
+            .set('Accept', 'application/json')
+            .disableTLSCerts() // For development use only
+            .use(throttle.plugin())
+            .send();
+
+        const data = response.body.data || [];
+        return data.filter(x => x?.type === 'organization');
+    } catch (error) {
+        console.error('Failed to fetch existing organizations:', error);
+        return false;
+    }
+}
+
+/**
+ * Create single organization
+ *
+ * @param org
+ * @returns {Promise<*|boolean>}
+ */
+async function createOrganization(org) {
+    try {
+        const payload = {
+            name: org.name,
+            type: 'organization'
+        };
+        const response = await request
+            .post(`${apiUrl}/contact`)
+            .set('Authorization', 'Bearer ' + apiKey)
+            .set('Accept', 'application/json')
+            .disableTLSCerts() //For development use only
+            .use(throttle.plugin())  // Applying the throttle plugin
+            .send(payload);
+        return response.body?.success?.id;
+    } catch (error) {
+        console.error('Failed to create organization:', error);
+        return false;
+    }
+}
+
+/**
  * Create single contact
  *
  * @param singleContact
@@ -149,7 +232,7 @@ async function createContact(singleContact) {
 }
 
 /**
- * Create single contact
+ * Update single contact by uuid
  *
  * @param singleContact
  * @param uuid
@@ -167,7 +250,7 @@ async function updateContact(singleContact, uuid) {
             .send(singleContact);
         return response.body.success.id;
     } catch (error) {
-        console.error('Failed to create new contact:', error);
+        console.error('Failed to update contact:', error);
         return false;  // Return false if the API call fails
     }
 }
